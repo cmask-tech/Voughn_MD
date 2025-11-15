@@ -1,15 +1,11 @@
 // core/features.js
 const database = require('./database');
 const { colorful, extractPhoneFromJid, isGroupJid } = require('./utils');
-const fs = require('fs');
-const path = require('path');
 
 class Features {
     constructor(bot) {
         this.bot = bot;
         this.sock = null;
-        
-        // Caches and storage
         this.deletedMessages = new Map();
         this.editedMessages = new Map();
         this.userActivity = new Map();
@@ -19,11 +15,13 @@ class Features {
         this.recordingTimeouts = new Map();
         this.viewOnceMessages = new Map();
         this.savedMediaPath = './saved-media';
+        this.chatbotEnabled = false;
+        this.chatbotHelper = null;
         
-        // Feature states
+        // Feature states - all disabled by default
         this.featureStates = {
-            antidelete: true,
-            antiedit: true,
+            antidelete: false,
+            antiedit: false,
             autoview: false,
             autoreact: false,
             autotyping: false,
@@ -32,22 +30,8 @@ class Features {
             anticall: false,
             antideletestatus: false,
             antispam: false,
-            autoreactmsg: false,
-            antibug: true,
-            autoblock: false,
-            antidemote: true
+            autoreactmsg: false
         };
-
-        // Chatbot
-        this.chatbotEnabled = false;
-        this.chatbotHelper = null;
-        
-        this.initialized = false;
-        
-        // Create saved media directory
-        if (!fs.existsSync(this.savedMediaPath)) {
-            fs.mkdirSync(this.savedMediaPath, { recursive: true });
-        }
     }
 
     setSocket(sock) {
@@ -59,16 +43,15 @@ class Features {
         this.sock.ev.on('messages.delete', async (deleteData) => {
             if (!this.featureStates.antidelete || !deleteData.keys || !this.bot.ownerJid) return;
             
-            colorful.info(`🔍 Anti-delete detected: ${deleteData.keys.length} messages`);
-            
             for (const key of deleteData.keys) {
                 try {
-                    const deletedMessage = this.deletedMessages.get(key.id);
+                    //retrieve from cahe
+                    const deletedMessage = this.deletedMessages.get(key.id) || 
+                                         await this.findRecentMessage(key);
                     
                     if (deletedMessage) {
                         const content = this.extractMessageContent(deletedMessage);
                         const deleter = key.participant || 'Unknown';
-                        const chatType = isGroupJid(key.remoteJid) ? 'Group' : 'DM';
                         
                         // Log to database
                         await database.logDeletedMessage(
@@ -78,22 +61,28 @@ class Features {
                             deletedMessage.message ? Object.keys(deletedMessage.message)[0] : 'text'
                         );
 
-                        // Send notification to owner
+                        // Send mesej tu owner
                         const deleteInfo = `
 🚨 *MESSAGE DELETED* 🚨
 ━━━━━━━━━━━━━━━━━━━━
-💬 *Content:* ${content.substring(0, 200)}${content.length > 200 ? '...' : ''}
 👤 *Deleted By:* ${deleter}
+💬 *Content:* ${content.substring(0, 200)}${content.length > 200 ? '...' : ''}
 📱 *Chat:* ${key.remoteJid}
-🏷️ *Type:* ${chatType}
 ⏰ *Time:* ${new Date().toLocaleString()}
                         `.trim();
 
                         await this.sock.sendMessage(this.bot.ownerJid, { text: deleteInfo });
-                        colorful.success(`📨 Sent delete alert for message from ${deleter}`);
                         
-                        // Remove from cache after processing
-                        this.deletedMessages.delete(key.id);
+                        // Also notify in group if enabled
+                        if (isGroupJid(key.remoteJid)) {
+                            const groupSettings = await database.getGroupSettings(key.remoteJid);
+                            if (groupSettings?.antidelete) {
+                                await this.sock.sendMessage(key.remoteJid, {
+                                    text: `⚠️ @${deleter.split('@')[0]} deleted a message!`,
+                                    mentions: [deleter]
+                                });
+                            }
+                        }
                     }
                 } catch (error) {
                     colorful.error(`Anti-delete error: ${error.message}`);
@@ -105,55 +94,43 @@ class Features {
     // ==================== ANTI-EDIT FEATURE ====================
     async setupAntiEdit() {
         this.sock.ev.on('messages.update', async (updates) => {
-            if (!this.featureStates.antiedit || !this.bot.ownerJid) return;
+            if (!this.featureStates.antiedit) return;
             
             for (const update of updates) {
-                try {
-                    if (update.update?.message?.protocolMessage?.editedMessage) {
+                if (update.update?.message?.protocolMessage?.editedMessage && this.bot.ownerJid) {
+                    try {
                         const originalMessage = this.editedMessages.get(update.key.id);
+                        const editedMessage = update.update.message.protocolMessage.editedMessage;
                         
                         if (originalMessage) {
-                            const editedMessage = update.update.message.protocolMessage.editedMessage;
                             const originalContent = this.extractMessageContent(originalMessage);
                             const editedContent = this.extractMessageContent({ message: editedMessage });
                             const editor = update.key.participant || 'Unknown';
-                            const chatType = isGroupJid(update.key.remoteJid) ? 'Group' : 'DM';
 
-                            // Only notify if content actually changed
-                            if (originalContent !== editedContent) {
-                                // Log to database
-                                await database.logEditedMessage(
-                                    update.key.remoteJid,
-                                    editor,
-                                    originalContent,
-                                    editedContent
-                                );
+                            // Log to database
+                            await database.logEditedMessage(
+                                update.key.remoteJid,
+                                editor,
+                                originalContent,
+                                editedContent
+                            );
 
-                                // Send notification to owner
-                                const editInfo = `
+                            // Send msg to owner
+                            const editInfo = `
 🚨 *MESSAGE EDITED* 🚨
 ━━━━━━━━━━━━━━━━━━━━
 👤 *Edited By:* ${editor}
 📜 *Original:* ${originalContent.substring(0, 150)}${originalContent.length > 150 ? '...' : ''}
 📝 *Edited:* ${editedContent.substring(0, 150)}${editedContent.length > 150 ? '...' : ''}
 📱 *Chat:* ${update.key.remoteJid}
-🏷️ *Type:* ${chatType}
 ⏰ *Time:* ${new Date().toLocaleString()}
-                                `.trim();
+                            `.trim();
 
-                                await this.sock.sendMessage(this.bot.ownerJid, { text: editInfo });
-                                colorful.success(`📨 Sent edit alert for message from ${editor}`);
-                            }
-                            
-                            // Update cache with edited message
-                            this.editedMessages.set(update.key.id, { 
-                                ...originalMessage, 
-                                message: editedMessage 
-                            });
+                            await this.sock.sendMessage(this.bot.ownerJid, { text: editInfo });
                         }
+                    } catch (error) {
+                        colorful.error(`Anti-edit error: ${error.message}`);
                     }
-                } catch (error) {
-                    colorful.error(`Anti-edit error: ${error.message}`);
                 }
             }
         });
@@ -165,21 +142,19 @@ class Features {
             if (!this.featureStates.autoview || m.type !== 'notify') return;
             
             for (const msg of m.messages) {
+                // Auto-view status updates
                 if (msg.key.remoteJid === 'status@broadcast') {
                     try {
                         await this.sock.readMessages([msg.key]);
-                        colorful.info(`👀 Auto-viewed status update`);
+                       // colorful.info(`👀 Auto-viewed status update`);
                         
-                        // Cache status content
+
                         const statusContent = this.extractMessageContent(msg);
                         if (statusContent && statusContent !== 'Unsupported message type') {
-                            this.deletedStatus.set(msg.key.id, {
-                                content: statusContent,
-                                timestamp: Date.now()
-                            });
+                            this.deletedStatus.set(msg.key.id, statusContent);
                         }
                     } catch (error) {
-                        // Silent fail
+                        // Silent fail for cmd nn
                     }
                 }
             }
@@ -194,6 +169,7 @@ class Features {
             for (const msg of m.messages) {
                 if (msg.key.remoteJid === 'status@broadcast') {
                     try {
+                        // Auto-react with emoji
                         const reactions = ['👍', '❤️', '🔥', '😂', '😮', '😢'];
                         const randomReaction = reactions[Math.floor(Math.random() * reactions.length)];
                         
@@ -218,23 +194,22 @@ class Features {
             if (!this.featureStates.autotyping || m.type !== 'notify') return;
             
             for (const msg of m.messages) {
+                // Auto-typing in response to messages
                 if (!msg.key.fromMe && msg.message) {
                     try {
                         const jid = msg.key.remoteJid;
                         
-                        // Clear existing timeout
                         if (this.typingTimeouts.has(jid)) {
                             clearTimeout(this.typingTimeouts.get(jid));
                         }
                         
-                        // Start typing
                         await this.sock.sendPresenceUpdate('composing', jid);
                         
-                        // Stop typing after random delay
+                        // Stop typing after 7-9 seconds 
                         const timeout = setTimeout(async () => {
                             await this.sock.sendPresenceUpdate('paused', jid);
                             this.typingTimeouts.delete(jid);
-                        }, 3000 + Math.random() * 4000);
+                        }, 7000 + Math.random() * 9000);
                         
                         this.typingTimeouts.set(jid, timeout);
                         
@@ -252,6 +227,7 @@ class Features {
             if (!this.featureStates.autorecording || m.type !== 'notify') return;
             
             for (const msg of m.messages) {
+                // Auto-recording for messages
                 if (!msg.key.fromMe && msg.message) {
                     try {
                         const jid = msg.key.remoteJid;
@@ -261,18 +237,16 @@ class Features {
                             clearTimeout(this.recordingTimeouts.get(jid));
                         }
                         
-                        // Start recording indicator
                         await this.sock.sendPresenceUpdate('recording', jid);
                         
-                        // Stop after delay
                         const timeout = setTimeout(async () => {
                             await this.sock.sendPresenceUpdate('paused', jid);
                             this.recordingTimeouts.delete(jid);
-                        }, 5000);
+                        }, 8000);
                         
                         this.recordingTimeouts.set(jid, timeout);
                         
-                        colorful.info(`🎙️ Auto-recording indicator for ${jid}`);
+                        colorful.info(`🎙️ Auto-recording indicator shown`);
                     } catch (error) {
                         // Silent fail
                     }
@@ -287,13 +261,11 @@ class Features {
             if (!this.featureStates.autoread || !m.messages) return;
             
             for (const msg of m.messages) {
-                if (!msg.key.fromMe) {
-                    try {
-                        await this.sock.readMessages([msg.key]);
-                        colorful.info(`📖 Auto-read message from ${msg.key.remoteJid}`);
-                    } catch (error) {
-                        // Silent fail
-                    }
+                try {
+                    await this.sock.readMessages([msg.key]);
+                    //colorful.info(`📖 Auto-read message from ${msg.key.remoteJid}`);
+                } catch (error) {
+                    // Silent fail
                 }
             }
         });
@@ -306,12 +278,12 @@ class Features {
             
             try {
                 await this.sock.rejectCall(call.id, call.from);
-                colorful.info(`📞 Auto-rejected call from: ${call.from}`);
+                colorful.info(`📞 Auto-declined call from: ${call.from}`);
                 
                 // Notify owner
                 if (this.bot.ownerJid) {
                     await this.sock.sendMessage(this.bot.ownerJid, {
-                        text: `📞 *CALL REJECTED*\n\n👤 From: ${call.from}\n⏰ Time: ${new Date().toLocaleString()}`
+                        text: `📞 *CALL DECLINED*\n\n👤 From: ${call.from}\n⏰ Time: ${new Date().toLocaleString()}`
                     });
                 }
             } catch (error) {
@@ -331,12 +303,9 @@ class Features {
                     if (deletedStatus) {
                         try {
                             await this.sock.sendMessage(this.bot.ownerJid, {
-                                text: `🗑️ *DELETED STATUS*\n\n💬 Content: ${deletedStatus.content}\n⏰ Time: ${new Date(deletedStatus.timestamp).toLocaleString()}`
+                                text: `🗑️ *DELETED STATUS*\n\n💬 Content: ${deletedStatus}\n⏰ Time: ${new Date().toLocaleString()}`
                             });
-                            colorful.info(`📊 Sent deleted status to owner`);
-                            
-                            // Remove from cache
-                            this.deletedStatus.delete(item.id);
+                           // colorful.info(`📊 Sent deleted status to owner`);
                         } catch (error) {
                             colorful.error(`Anti-delete status error: ${error.message}`);
                         }
@@ -365,12 +334,7 @@ class Features {
         
         // Initialize user spam data
         if (!this.spamDetection.has(userJid)) {
-            this.spamDetection.set(userJid, { 
-                count: 0, 
-                lastMessage: now, 
-                warned: false,
-                lastContent: ''
-            });
+            this.spamDetection.set(userJid, { count: 0, lastMessage: now, warned: false });
         }
         
         const userData = this.spamDetection.get(userJid);
@@ -424,7 +388,6 @@ class Features {
 
     isSpamMessage(message, userData) {
         const content = this.extractMessageContent(message);
-        userData.lastContent = content;
         
         // Spam detection criteria
         const spamCriteria = [
@@ -468,34 +431,32 @@ class Features {
     // ==================== ANTI-BUG FEATURE ====================
     async setupAntiBug() {
         this.sock.ev.on('messages.upsert', async (m) => {
-            if (!this.featureStates.antibug || m.type !== 'notify') return;
-            
-            for (const msg of m.messages) {
-                if (!msg.key.fromMe) {
-                    const isSuspicious = this.detectSuspiciousMessage(msg);
-                    const userJid = msg.key.participant || msg.key.remoteJid;
-                    
-                    if (isSuspicious) {
-                        colorful.warning(`🚨 Suspicious message detected from ${userJid}`);
+            if (m.type === 'notify') {
+                for (const msg of m.messages) {
+                    if (!msg.key.fromMe) {
+                        const isSuspicious = this.detectSuspiciousMessage(msg);
+                        const userJid = msg.key.participant || msg.key.remoteJid;
                         
-                        // Decrease trust score
-                        await database.updateUserTrust(userJid, -15);
-                        
-                        // Check if should block
-                        const isBlocked = await database.isUserBlocked(userJid);
-                        if (isBlocked && this.featureStates.autoblock) {
-                            try {
-                                await this.sock.updateBlockStatus(userJid, 'block');
-                                colorful.info(`🚫 Auto-blocked suspicious user: ${userJid}`);
-                                
-                                // Notify owner
-                                if (this.bot.ownerJid) {
+                        if (isSuspicious) {
+                            colorful.warning(`🚨 Suspicious message detected from ${userJid}`);
+                            
+                            // Decrease trust score
+                            await database.updateUserTrust(userJid, -15);
+                            
+                            // Check if should block
+                            const isBlocked = await database.isUserBlocked(userJid);
+                            if (isBlocked) {
+                                try {
+                                    await this.sock.updateBlockStatus(userJid, 'block');
+                                    colorful.info(`🚫 Auto-blocked suspicious user: ${userJid}`);
+                                    
+                                    // Notify owner
                                     await this.sock.sendMessage(this.bot.ownerJid, {
-                                        text: `🚨 *AUTO-BLOCKED SUSPICIOUS *\n\n👤 User: ${userJid}\n🛡️ Reason: Suspicious activity detected`
+                                        text: `🚨 *AUTO-BLOCKED SUSPICIOUS USER*\n\n👤 User: ${userJid}\n🛡️ Reason: Suspicious activity detected`
                                     });
+                                } catch (error) {
+                                    colorful.error(`Failed to block user: ${error.message}`);
                                 }
-                            } catch (error) {
-                                colorful.error(`Failed to block user: ${error.message}`);
                             }
                         }
                     }
@@ -504,22 +465,24 @@ class Features {
         });
     }
 
+    // ==================== AUTO-BLOCK FEATURE ====================
+    async setupAutoBlock() {
+        // This is handled in anti-bug feature
+        colorful.info('🔒 Auto-block integrated with anti-bug system');
+    }
+
     // ==================== ANTI-DEMOTE PROTECTION ====================
     async setupAntiDemote() {
         this.sock.ev.on('group-participants.update', async (update) => {
-            if (!this.featureStates.antidemote) return;
-            
             // Check if bot is being demoted
             if (update.action === 'demote' && update.participants.includes(this.sock.user.id)) {
                 try {
                     colorful.warning(`🛡️ Bot demotion detected in ${update.id}`);
                     
                     // Notify owner
-                    if (this.bot.ownerJid) {
-                        await this.sock.sendMessage(this.bot.ownerJid, {
-                            text: `⚠️ *BOT DEMOTED*\n\n🏷️ Group: ${update.id}\n🔧 Action: Bot was demoted from admin`
-                        });
-                    }
+                    await this.sock.sendMessage(this.bot.ownerJid, {
+                        text: `⚠️ *BOT DEMOTED*\n\n🏷️ Group: ${update.id}\n🔧 Action: Bot was demoted from admin`
+                    });
 
                     // Auto-leave group if enabled
                     const groupSettings = await database.getGroupSettings(update.id);
@@ -529,19 +492,240 @@ class Features {
                     }
                     
                 } catch (error) {
-                   // colorful.error(`Anti-demote error: ${error.message}`);
+                    colorful.error(`Anti-demote error: ${error.message}`);
                 }
             }
         });
     }
 
+    // ==================== MESSAGE CACHING ====================
+    async cacheMessage(message) {
+        if (message.key?.id) {
+            this.deletedMessages.set(message.key.id, message);
+            this.editedMessages.set(message.key.id, message);
+            
+            // Limit cache size to 1000 messages
+            if (this.deletedMessages.size > 1000) {
+                const firstKey = this.deletedMessages.keys().next().value;
+                this.deletedMessages.delete(firstKey);
+            }
+            if (this.editedMessages.size > 1000) {
+                const firstKey = this.editedMessages.keys().next().value;
+                this.editedMessages.delete(firstKey);
+            }
+        }
+    }
+
+
+
+// ==================== CHATBOT FEATURE ====================
+async setupChatbot() {
+    this.sock.ev.on('messages.upsert', async (m) => {
+        if (!this.chatbotEnabled || m.type !== 'notify') return;
+        
+        for (const msg of m.messages) {
+            await this.handleChatbotMessage(msg);
+        }
+    });
+}
+
+async handleChatbotMessage(message) {
+    try {
+        // Skip if message is from bot itself
+        if (message.key.fromMe) return;
+        
+        // Skip commands (messages starting with prefix)
+        const prefix = this.bot.settings?.getPrefix?.() || '.';
+        const messageContent = this.extractMessageContent(message);
+        
+        if (!messageContent || messageContent.startsWith(prefix)) {
+            return;
+        }
+
+        // Skip empty messages or system messages
+        if (messageContent === 'Unsupported message type' || !messageContent.trim()) {
+            return;
+        }
+
+        // Don't respond to group messages if not mentioned
+        if (this.isGroupJid(message.key.remoteJid)) {
+            const isMentioned = this.isBotMentioned(message);
+            if (!isMentioned) return;
+        }
+
+        // Show typing indicator
+        await this.sock.sendPresenceUpdate('composing', message.key.remoteJid);
+
+        // Get AI response with timeout
+        const response = await this.getChatbotResponse(messageContent, message);
+        
+        // Send response
+        if (response) {
+            await this.sock.sendMessage(message.key.remoteJid, { text: response });
+        }
+
+    } catch (error) {
+        colorful.error(`Chatbot error: ${error.message}`);
+        // Don't send error message to user to avoid spam
+    }
+}
+
+async getChatbotResponse(messageContent, message) {
+    try {
+        if (!this.chatbotHelper) {
+            this.chatbotHelper = require('./helpers/chatbot');
+        }
+
+        const userId = message.key.participant || message.key.remoteJid;
+        const language = 'auto';
+        
+        // Add timeout to prevent hanging
+        const response = await Promise.race([
+            this.chatbotHelper.chat(messageContent, userId, language),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Response timeout')), 15000)
+            )
+        ]);
+        
+        return response;
+
+    } catch (error) {
+        colorful.error(`Chatbot response error: ${error.message}`);
+        
+        // Return a friendly fallback message
+        const fallbacks ="🎯 Having some technical difficulties. Let's try that again!";
+        
+        return fallbacks;
+    }
+}
+
+isBotMentioned(message) {
+    if (!message.message?.extendedTextMessage?.contextInfo?.mentionedJid) {
+        return false;
+    }
+    
+    const mentionedJids = message.message.extendedTextMessage.contextInfo.mentionedJid;
+    const botJid = this.sock.user?.id;
+    
+    return mentionedJids.includes(botJid);
+}
+
+isGroupJid(jid) {
+    return jid.endsWith('@g.us');
+}
+
+enableChatbot() {
+    this.chatbotEnabled = true;
+    colorful.info('🤖 Chatbot enabled - will reply to all messages');
+    
+    // Auto-disable after 6 hours to prevent accidental always-on
+    setTimeout(() => {
+        if (this.chatbotEnabled) {
+            this.chatbotEnabled = false;
+            colorful.info('🤖 Chatbot auto-disabled after 6 hours');
+            
+            // Notify owner
+            if (this.bot.ownerJid) {
+                this.sock.sendMessage(this.bot.ownerJid, {
+                    text: '🤖 Chatbot has been automatically disabled.'
+                }).catch(() => {});
+            }
+        }
+    }, 1 * 60 * 60 * 1000); // 1 hour
+}
+
+disableChatbot() {
+    this.chatbotEnabled = false;
+    colorful.info('🤖 Chatbot disabled');
+}
+
+toggleChatbot() {
+    this.chatbotEnabled = !this.chatbotEnabled;
+    colorful.info(`🤖 Chatbot ${this.chatbotEnabled ? 'enabled' : 'disabled'}`);
+    return this.chatbotEnabled;
+}
+
+getChatbotStatus() {
+    return this.chatbotEnabled;
+}
+
+
+
+    // ==================== HELPER METHODS ====================
+    extractMessageContent(message) {
+        if (!message.message) return 'Unsupported message type';
+        
+        const messageType = Object.keys(message.message)[0];
+        switch (messageType) {
+            case 'conversation':
+                return message.message.conversation;
+            case 'extendedTextMessage':
+                return message.message.extendedTextMessage.text;
+            case 'imageMessage':
+                return '[Image] ' + (message.message.imageMessage.caption || '');
+            case 'videoMessage':
+                return '[Video] ' + (message.message.videoMessage.caption || '');
+            case 'audioMessage':
+                return '[Audio Message]';
+            case 'documentMessage':
+                return `[Document] ${message.message.documentMessage.fileName || 'File'}`;
+            case 'stickerMessage':
+                return '[Sticker]';
+            default:
+                return `[${messageType}]`;
+        }
+    }
+
+    async findRecentMessage(key) {
+        // In a real implementation, you might want to maintain a recent messages cache
+        // For now, return null and rely on the in-memory cache
+        return null;
+    }
+
+    detectSuspiciousMessage(message) {
+        const content = this.extractMessageContent(message).toLowerCase();
+        
+        // Suspicious patterns
+        const suspiciousPatterns = [
+            /http.*\.(exe|bin|scr|com|bat|vbs|js)/i,
+            /script.*alert/i,
+            /eval.*\(/i,
+            /base64_decode/i,
+            /javascript:/i,
+            /onmouseover=/i,
+            /onload=/i,
+            /<script>/i,
+            /document\.cookie/i,
+            /window\.location/i,
+            /phishing|scam|fraud/i,
+            /bitcoin.*wallet/i,
+            /password.*reset/i,
+            /bank.*account/i
+        ];
+
+        // Check for suspicious links
+        const urlRegex = /https?:\/\/[^\s]+/g;
+        const urls = content.match(urlRegex);
+        if (urls) {
+            for (const url of urls) {
+                if (url.includes('bit.ly') || url.includes('tinyurl') || url.includes('shorte.st')) {
+                    return true;
+                }
+            }
+        }
+
+        // Check for suspicious patterns
+        return suspiciousPatterns.some(pattern => pattern.test(content));
+    }
+
+
     // ==================== VIEW ONCE MESSAGE HANDLER ====================
     async setupViewOnceHandler() {
         this.sock.ev.on('messages.upsert', async (m) => {
-            if (!m.messages) return;
-            
-            for (const msg of m.messages) {
-                await this.handleViewOnceMessage(msg);
+            if (m.messages) {
+                for (const msg of m.messages) {
+                    await this.handleViewOnceMessage(msg);
+                }
             }
         });
     }
@@ -583,7 +767,7 @@ class Features {
                 colorful.info(`📸 View-once ${mediaType} saved from ${sender}`);
             }
         } catch (error) {
-            //colorful.error(`View-once handler error: ${error.message}`);
+            colorful.error(`View-once handler error: ${error.message}`);
         }
     }
 
@@ -597,6 +781,11 @@ class Features {
 
     async saveViewOnceMedia(message, mediaType) {
         try {
+            // Create saved-media directory if it doesn't exist
+            if (!require('fs').existsSync(this.savedMediaPath)) {
+                require('fs').mkdirSync(this.savedMediaPath, { recursive: true });
+            }
+
             const mediaKey = mediaType === 'image' ? 
                 (message.message.viewOnceMessage?.imageMessage || 
                  message.message.viewOnceMessageV2?.imageMessage) :
@@ -612,10 +801,10 @@ class Features {
             const fileId = message.key.id;
             const extension = mediaType === 'image' ? '.jpg' : '.mp4';
             const fileName = `viewonce_${fileId}${extension}`;
-            const filePath = path.join(this.savedMediaPath, fileName);
+            const filePath = require('path').join(this.savedMediaPath, fileName);
 
             // Save file
-            fs.writeFileSync(filePath, mediaBuffer);
+            require('fs').writeFileSync(filePath, mediaBuffer);
 
             // Get caption if available
             const caption = mediaKey.caption || '';
@@ -645,222 +834,48 @@ class Features {
 
             await this.sock.sendMessage(this.bot.ownerJid, { text: notification });
         } catch (error) {
-            colorful.error(`View-once notification failed: ${error.message}`);
+            //colorful.error(`View-once notification failed: ${error.message}`);
         }
     }
 
-    // ==================== CHATBOT FEATURE ====================
-    async setupChatbot() {
-        this.sock.ev.on('messages.upsert', async (m) => {
-            if (!this.chatbotEnabled || m.type !== 'notify') return;
-            
-            for (const msg of m.messages) {
-                await this.handleChatbotMessage(msg);
-            }
-        });
-    }
-
-    async handleChatbotMessage(message) {
-        try {
-            // Skip if message is from bot itself
-            if (message.key.fromMe) return;
-            
-            // Skip commands (messages starting with prefix)
-            const prefix = this.bot.settings?.getPrefix?.() || '.';
-            const messageContent = this.extractMessageContent(message);
-            
-            if (!messageContent || messageContent.startsWith(prefix)) {
-                return;
-            }
-
-            // Skip empty messages or system messages
-            if (messageContent === 'Unsupported message type' || !messageContent.trim()) {
-                return;
-            }
-
-            // Don't respond to group messages if not mentioned
-            if (this.isGroupJid(message.key.remoteJid)) {
-                const isMentioned = this.isBotMentioned(message);
-                if (!isMentioned) return;
-            }
-
-            // Show typing indicator
-            await this.sock.sendPresenceUpdate('composing', message.key.remoteJid);
-
-            // Get AI response with timeout
-            const response = await this.getChatbotResponse(messageContent, message);
-            
-            // Send response
-            if (response) {
-                await this.sock.sendMessage(message.key.remoteJid, { text: response });
-            }
-
-        } catch (error) {
-            colorful.error(`Chatbot error: ${error.message}`);
+    // Get saved view-once media
+    getSavedViewOnce(mediaId = null) {
+        if (mediaId) {
+            return this.viewOnceMessages.get(mediaId);
+        } else {
+            // Return all saved media (latest first)
+            return Array.from(this.viewOnceMessages.values())
+                .sort((a, b) => b.timestamp - a.timestamp);
         }
     }
 
-    async getChatbotResponse(messageContent, message) {
-        try {
-            if (!this.chatbotHelper) {
-                // Try to load chatbot helper
+    // Clean up old media files
+    cleanupOldMedia(maxAge = 2 * 60 * 60 * 1000) { // 2 hours default
+        const now = Date.now();
+        for (const [id, media] of this.viewOnceMessages.entries()) {
+            if (now - media.timestamp > maxAge) {
                 try {
-                    this.chatbotHelper = require('./helpers/chatbot');
-                } catch (e) {
-                    return "🤖 Chatbot feature is not available right now.";
-                }
-            }
-
-            const userId = message.key.participant || message.key.remoteJid;
-            const language = 'auto';
-            
-            // Add timeout to prevent hanging
-            const response = await Promise.race([
-                this.chatbotHelper.chat(messageContent, userId, language),
-                new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Response timeout')), 15000)
-                )
-            ]);
-            
-            return response;
-
-        } catch (error) {
-            colorful.error(`Chatbot response error: ${error.message}`);
-            return "🎯 I'm having some technical difficulties. Let's try that again!";
-        }
-    }
-
-    isBotMentioned(message) {
-        if (!message.message?.extendedTextMessage?.contextInfo?.mentionedJid) {
-            return false;
-        }
-        
-        const mentionedJids = message.message.extendedTextMessage.contextInfo.mentionedJid;
-        const botJid = this.sock.user?.id;
-        
-        return mentionedJids.includes(botJid);
-    }
-
-    isGroupJid(jid) {
-        return jid.endsWith('@g.us');
-    }
-
-    // ==================== MESSAGE CACHING ====================
-    async cacheMessage(message) {
-        if (!message.key?.id) return;
-        
-        try {
-            // Cache for anti-delete (all messages)
-            this.deletedMessages.set(message.key.id, JSON.parse(JSON.stringify(message)));
-            
-            // Cache for anti-edit (only text messages)
-            const messageType = Object.keys(message.message || {})[0];
-            if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
-                this.editedMessages.set(message.key.id, JSON.parse(JSON.stringify(message)));
-            }
-            
-            // Limit cache size
-            this.cleanupCache();
-            
-        } catch (error) {
-            colorful.error(`Cache error: ${error.message}`);
-        }
-    }
-
-    cleanupCache() {
-        const maxSize = 1000;
-        
-        if (this.deletedMessages.size > maxSize) {
-            const firstKey = this.deletedMessages.keys().next().value;
-            this.deletedMessages.delete(firstKey);
-        }
-        
-        if (this.editedMessages.size > maxSize) {
-            const firstKey = this.editedMessages.keys().next().value;
-            this.editedMessages.delete(firstKey);
-        }
-    }
-
-    // ==================== HELPER METHODS ====================
-    extractMessageContent(message) {
-        if (!message.message) return 'Unsupported message type';
-        
-        try {
-            const messageType = Object.keys(message.message)[0];
-            switch (messageType) {
-                case 'conversation':
-                    return message.message.conversation || '[Empty text]';
-                case 'extendedTextMessage':
-                    return message.message.extendedTextMessage?.text || '[Empty extended text]';
-                case 'imageMessage':
-                    return `[Image] ${message.message.imageMessage?.caption || ''}`.trim();
-                case 'videoMessage':
-                    return `[Video] ${message.message.videoMessage?.caption || ''}`.trim();
-                case 'audioMessage':
-                    return '[Audio Message]';
-                case 'documentMessage':
-                    return `[Document] ${message.message.documentMessage?.fileName || 'File'}`;
-                case 'stickerMessage':
-                    return '[Sticker]';
-                case 'contactMessage':
-                    return '[Contact]';
-                case 'locationMessage':
-                    return '[Location]';
-                case 'viewOnceMessage':
-                case 'viewOnceMessageV2':
-                    return '[View Once Media]';
-                default:
-                    return `[${messageType}]`;
-            }
-        } catch (error) {
-            return 'Error extracting content';
-        }
-    }
-
-    detectSuspiciousMessage(message) {
-        const content = this.extractMessageContent(message).toLowerCase();
-        
-        // Suspicious patterns
-        const suspiciousPatterns = [
-            /http.*\.(exe|bin|scr|com|bat|vbs|js)/i,
-            /script.*alert/i,
-            /eval.*\(/i,
-            /base64_decode/i,
-            /javascript:/i,
-            /onmouseover=/i,
-            /onload=/i,
-            /<script>/i,
-            /document\.cookie/i,
-            /window\.location/i,
-            /phishing|scam|fraud/i,
-            /bitcoin.*wallet/i,
-            /password.*reset/i,
-            /bank.*account/i
-        ];
-
-        // Check for suspicious links
-        const urlRegex = /https?:\/\/[^\s]+/g;
-        const urls = content.match(urlRegex);
-        if (urls) {
-            for (const url of urls) {
-                if (url.includes('bit.ly') || url.includes('tinyurl') || url.includes('shorte.st')) {
-                    return true;
+                    if (require('fs').existsSync(media.filePath)) {
+                        require('fs').unlinkSync(media.filePath);
+                    }
+                    this.viewOnceMessages.delete(id);
+                } catch (error) {
+                    colorful.error(`Cleanup failed for ${id}: ${error.message}`);
                 }
             }
         }
-
-        // Check for suspicious patterns
-        return suspiciousPatterns.some(pattern => pattern.test(content));
     }
+
+
+
 
     // ==================== FEATURE CONTROL METHODS ====================
     enableFeature(featureName) {
         if (this.featureStates.hasOwnProperty(featureName)) {
             this.featureStates[featureName] = true;
-            colorful.success(`✅ Enabled feature: ${featureName}`);
+            colorful.info(`✅ Enabled feature: ${featureName}`);
             return true;
         }
-        colorful.error(`❌ Unknown feature: ${featureName}`);
         return false;
     }
 
@@ -870,15 +885,13 @@ class Features {
             colorful.info(`❌ Disabled feature: ${featureName}`);
             return true;
         }
-        colorful.error(`❌ Unknown feature: ${featureName}`);
         return false;
     }
 
     toggleFeature(featureName) {
         if (this.featureStates.hasOwnProperty(featureName)) {
             this.featureStates[featureName] = !this.featureStates[featureName];
-            const status = this.featureStates[featureName] ? 'Enabled' : 'Disabled';
-            colorful.info(`🔄 ${status} feature: ${featureName}`);
+            colorful.info(`🔄 ${this.featureStates[featureName] ? 'Enabled' : 'Disabled'} feature: ${featureName}`);
             return this.featureStates[featureName];
         }
         return false;
@@ -892,99 +905,9 @@ class Features {
         return { ...this.featureStates };
     }
 
-    // Chatbot control methods
-    enableChatbot() {
-        this.chatbotEnabled = true;
-        colorful.info('🤖 Chatbot enabled');
-        return true;
-    }
-
-    disableChatbot() {
-        this.chatbotEnabled = false;
-        colorful.info('🤖 Chatbot disabled');
-        return true;
-    }
-
-    toggleChatbot() {
-        this.chatbotEnabled = !this.chatbotEnabled;
-        colorful.info(`🤖 Chatbot ${this.chatbotEnabled ? 'enabled' : 'disabled'}`);
-        return this.chatbotEnabled;
-    }
-
-    getChatbotStatus() {
-        return this.chatbotEnabled;
-    }
-
-    // ==================== TEST METHODS ====================
-    async testAntiDelete() {
-        if (!this.sock || !this.bot.ownerJid) {
-            colorful.error('❌ Cannot test: Socket or owner JID not available');
-            return false;
-        }
-
-        try {
-            const testMessage = await this.sock.sendMessage(this.bot.ownerJid, {
-                text: '🧪 TEST MESSAGE - Please delete this to test anti-delete feature'
-            });
-            
-            if (testMessage.key?.id) {
-                this.deletedMessages.set(testMessage.key.id, {
-                    key: testMessage.key,
-                    message: { conversation: '🧪 TEST MESSAGE - Please delete this to test anti-delete feature' }
-                });
-                colorful.success(`✅ Test message sent and cached: ${testMessage.key.id}`);
-                
-                await this.sock.sendMessage(this.bot.ownerJid, {
-                    text: '✅ Anti-delete test setup! Now delete the previous message to test.'
-                });
-                return true;
-            }
-        } catch (error) {
-            colorful.error(`❌ Test failed: ${error.message}`);
-        }
-        return false;
-    }
-
-    async testAntiEdit() {
-        if (!this.sock || !this.bot.ownerJid) {
-            colorful.error('❌ Cannot test: Socket or owner JID not available');
-            return false;
-        }
-
-        try {
-            const testMessage = await this.sock.sendMessage(this.bot.ownerJid, {
-                text: '🧪 TEST MESSAGE - Please edit this to test anti-edit feature'
-            });
-            
-            if (testMessage.key?.id) {
-                this.editedMessages.set(testMessage.key.id, {
-                    key: testMessage.key,
-                    message: { conversation: '🧪 TEST MESSAGE - Please edit this to test anti-edit feature' }
-                });
-                colorful.success(`✅ Test message sent and cached: ${testMessage.key.id}`);
-                
-                await this.sock.sendMessage(this.bot.ownerJid, {
-                    text: '✅ Anti-edit test setup! Now edit the previous message to test.'
-                });
-                return true;
-            }
-        } catch (error) {
-            colorful.error(`❌ Test failed: ${error.message}`);
-        }
-        return false;
-    }
-
     // ==================== INITIALIZE ALL FEATURES ====================
     async initializeAllFeatures() {
-        if (this.initialized) {
-            colorful.info('✅ Features already initialized');
-            return;
-        }
-
         try {
-            colorful.info('🚀 Initializing all features...');
-            
-            // Initialize all features
             await this.setupAntiDelete();
             await this.setupAntiEdit();
             await this.setupAutoViewStatus();
@@ -997,17 +920,11 @@ class Features {
             await this.setupAntiSpam();
             await this.setupAutoReactMessages();
             await this.setupAntiBug();
+            await this.setupAutoBlock();
             await this.setupAntiDemote();
             await this.setupViewOnceHandler();
             await this.setupChatbot();
             
-            // Enable essential features by default
-            this.enableFeature('antidelete');
-            this.enableFeature('antiedit');
-            this.enableFeature('antidemote');
-            this.enableFeature('antibug');
-            
-            this.initialized = true;
             colorful.success('✅ All features initialized successfully');
             
         } catch (error) {
@@ -1015,86 +932,30 @@ class Features {
         }
     }
 
-    // ==================== PROCESS MESSAGES FOR FEATURES ====================
+    // Method to cache messages from main message handler
     async processMessageForFeatures(message) {
-        try {
-            // Cache ALL messages (both from me and others)
-            await this.cacheMessage(message);
-            
-            // Track user activity
-            const userJid = message.key.participant || message.key.remoteJid;
-            this.userActivity.set(userJid, Date.now());
-            
-            // Cache status messages
-            if (message.key.remoteJid === 'status@broadcast') {
-                const statusContent = this.extractMessageContent(message);
-                if (statusContent && statusContent !== 'Unsupported message type') {
-                    this.deletedStatus.set(message.key.id, {
-                        content: statusContent,
-                        timestamp: Date.now()
-                    });
-                }
-            }
-            
-        } catch (error) {
-            colorful.error(`Feature processing error: ${error.message}`);
-        }
-    }
-
-    // ==================== UTILITY METHODS ====================
-    getCacheStats() {
-        return {
-            deletedMessages: this.deletedMessages.size,
-            editedMessages: this.editedMessages.size,
-            userActivity: this.userActivity.size,
-            deletedStatus: this.deletedStatus.size,
-            viewOnceMessages: this.viewOnceMessages.size,
-            spamDetection: this.spamDetection.size
-        };
-    }
-
-    getSavedViewOnce(mediaId = null) {
-        if (mediaId) {
-            return this.viewOnceMessages.get(mediaId);
-        } else {
-            return Array.from(this.viewOnceMessages.values())
-                .sort((a, b) => b.timestamp - a.timestamp);
-        }
-    }
-
-    cleanupOldMedia(maxAge = 2 * 60 * 60 * 1000) {
-        const now = Date.now();
-        for (const [id, media] of this.viewOnceMessages.entries()) {
-            if (now - media.timestamp > maxAge) {
-                try {
-                    if (fs.existsSync(media.filePath)) {
-                        fs.unlinkSync(media.filePath);
-                    }
-                    this.viewOnceMessages.delete(id);
-                } catch (error) {
-                    colorful.error(`Cleanup failed for ${id}: ${error.message}`);
-                }
+        await this.cacheMessage(message);
+        
+        // Track user activity for trust scoring
+        const userJid = message.key.participant || message.key.remoteJid;
+        this.userActivity.set(userJid, Date.now());
+        
+        // Cache status messages for anti-delete status feature
+        if (message.key.remoteJid === 'status@broadcast') {
+            const statusContent = this.extractMessageContent(message);
+            if (statusContent && statusContent !== 'Unsupported message type') {
+                this.deletedStatus.set(message.key.id, statusContent);
             }
         }
     }
 
-    // ==================== CLEANUP ====================
+    // Cleanup method
     cleanup() {
         // Clear all timeouts
         this.typingTimeouts.forEach(timeout => clearTimeout(timeout));
         this.recordingTimeouts.forEach(timeout => clearTimeout(timeout));
         this.typingTimeouts.clear();
         this.recordingTimeouts.clear();
-        
-        // Clear caches
-        this.deletedMessages.clear();
-        this.editedMessages.clear();
-        this.userActivity.clear();
-        this.deletedStatus.clear();
-        this.spamDetection.clear();
-        
-        this.initialized = false;
-        colorful.info('🧹 Features cleaned up');
     }
 }
 

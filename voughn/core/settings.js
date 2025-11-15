@@ -32,7 +32,6 @@ class Settings {
         return this.settings?.owner_jid;
     }
     
-
     async canUserUseCommand(userJid, command) {
         try {
             // Always allow if no owner is set yet (first-time setup)
@@ -40,11 +39,10 @@ class Settings {
                 return true;
             }
             
-            const normalizedJid = userJid.replace(/:\d+@/, '@');
-            const isOwner = await database.isOwner(normalizedJid);
-            const isSudo = await database.isSudo(normalizedJid);
+            const isOwner = await database.isOwner(userJid);
+            const isSudo = await database.isSudo(userJid);
             
-            console.log(`🔐 Permission Check for ${normalizedJid}:`);
+            console.log(`🔐 Permission Check for ${userJid}:`);
             console.log(`  - Is Owner: ${isOwner}`);
             console.log(`  - Is Sudo: ${isSudo}`);
             console.log(`  - Command Owner Only: ${command.ownerOnly}`);

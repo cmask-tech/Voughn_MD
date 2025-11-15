@@ -10,7 +10,7 @@ class ChatbotHelper {
     // Enhanced Gemini with conversation context
     static async geminiChat(prompt, userId, language = 'en') {
         try {
-            const API_KEY = AIzaSyC-w8_WKOTOZS0OQiESvp5na4idD-wHq-k;
+            const API_KEY = process.env.GEMINI_API_KEY;
             
             if (!API_KEY || API_KEY === '' || API_KEY.includes('xxxx')) {
                 //console.log('⚠️  Gemini key not set, using simple AI');

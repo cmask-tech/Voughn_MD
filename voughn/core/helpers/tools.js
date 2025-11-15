@@ -7,7 +7,7 @@ const sharp = require('sharp');
 class ToolsHelper {
     static async getWeather(city) {
         try {
-            const API_KEY = cdc39cab175dcb28c0261593e79847b3;
+            const API_KEY = process.env.OPENWEATHER_API_KEY;
             
             if (!API_KEY || API_KEY === 'your_actual_openweather_api_key_here') {
                 return `❌ Weather fetch error!`;
@@ -119,7 +119,7 @@ class ToolsHelper {
     // Additional: Weather forecast for next 5 days
     static async getWeatherForecast(city) {
         try {
-            const API_KEY = cdc39cab175dcb28c0261593e79847b3;
+            const API_KEY = process.env.OPENWEATHER_API_KEY;
             
             if (!API_KEY) {
                 return '❌ Weather fetch error.';

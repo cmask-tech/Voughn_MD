@@ -30,34 +30,6 @@ class WhatsAppBot {
 
         this.menuManager = menuManager;
     }
-
-    // Add this method to your WhatsAppBot class in bot.js
-    async shouldProcessMessage(msg) {
-        try {
-            const userJid = msg.key.participant ? msg.key.participant : msg.key.remoteJid;
-            const normalizedJid = userJid.replace(/:\d+@/, '@'); // Remove device ID
-            
-            // Get current mode from settings
-            const currentMode = settings.getMode();
-            
-            console.log(`🔍 Mode Check: ${currentMode}, User: ${normalizedJid}`);
-            
-            // If mode is public, process all messages
-            if (currentMode === 'public') {
-                return true;
-            }
-            
-            // If mode is private, only process owner messages
-            const isOwner = await database.isOwner(normalizedJid);
-            console.log(`   Is Owner: ${isOwner}`);
-            
-            return isOwner;
-            
-        } catch (error) {
-            console.error('Mode check error:', error);
-            return false; // Default to false on error
-        }
-    }
     
     async initialize() {
         try {
@@ -287,7 +259,7 @@ class WhatsAppBot {
         });
     }
         // In the processMessage method, add detailed logging:
-// In bot.js, replace the processMessage method with this:
+    // In bot.js, update the processMessage method:
     async processMessage(msg) {
         try {
             //colorful.info(`🔍 PROCESSING MESSAGE: ${msg.key.remoteJid}`);
@@ -317,16 +289,10 @@ class WhatsAppBot {
             const sender = msg.key.participant || msg.key.remoteJid;
             const isFromMe = msg.key.fromMe;
             colorful.info(`📨 Message INFO:
-        From: ${sender}
-        FromMe: ${isFromMe}
-        Type: ${messageType}
-        Content: "${messageContent}"\n`);
-            
-            // Check if message should be processed based on mode
-            if (!await this.shouldProcessMessage(msg)) {
-               // console.log('🚫 Ignoring message - bot is in private mode and user is not owner');
-                return;
-            }
+    From: ${sender}
+    FromMe: ${isFromMe}
+    Type: ${messageType}
+    Content: "${messageContent}"\n`);
             
             // TEST: Respond to ANY message that starts with "test"
             if (messageContent.toLowerCase().startsWith('test')) {
@@ -354,11 +320,11 @@ class WhatsAppBot {
                 return;
             }
             
+            
             // Execute the command
             await command.execute(this.sock, msg, args, this);
             
         } catch (error) {
-            console.error('Message processing error:', error);
         }
     }
 
