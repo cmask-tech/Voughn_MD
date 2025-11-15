@@ -1,6 +1,6 @@
 # Voughn_MD - Advanced WhatsApp Bot 🤖
 
-A feature-rich WhatsApp bot built with Node.js and Baileys library.
+A feature-rich WhatsApp bot built with Node.js.
 
 ## cmask-dev
 
